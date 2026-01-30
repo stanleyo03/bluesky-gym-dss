@@ -3,6 +3,8 @@ import pygame
 
 import bluesky as bs
 from bluesky_gym.envs.common.screen_dummy import ScreenDummy
+import bluesky_gym.envs.common.functions as fn
+
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -12,41 +14,40 @@ from gymnasium import spaces
 # Constants
 # =========================
 
+# Normalization constants
 ALT_MEAN = 1500
 ALT_STD = 3000
-ALT_MEAN = 0
-ALT_STD = 5
 
-X_MEAN = 0
-X_STD = 100
-VX_MEAN = 0
-VX_STD = 10
+# Aircraft parameters
+AC_SPD = 150
+ACTION_FREQUENCY = 20
 
-Y_MEAN = 0
-Y_STD = 100
-VY_MEAN = 0
-VY_STD = 10
+# Action scaling
+ACTION_2_MS = 12.5  # Vertical speed scaling (m/s)
+D_HEADING = 45      # Heading change scaling (degrees)
 
-ACTION_2_MS_VERT = 12.5
-ACTION_2_MS_HORIZ = 8.0
-
+# Reward parameters
 ALT_DIF_REWARD_SCALE = -5 / 3000
-LANDING_REWARD = 100
-LANDING_DISTANCE_THRESHOLD = 5  # km
+REACH_REWARD = 100
 CRASH_PENALTY = -100
+RWY_ALT_DIF_REWARD_SCALE = -5/300
 
+# Altitude initialization
 ALT_MIN = 2000
 ALT_MAX = 4000
 TARGET_ALT_DIF = 500
 
-AC_SPD = 150
-ACTION_FREQUENCY = 30
+VZ_MEAN = 0
+VZ_STD = 5
 
+# Rendering
 MAX_ALT_RENDER = 5000
-MAX_X_RANGE = 50  # km
-MAX_Y_RANGE = 50  # km
-MAX_DISTANCE = 180  # km
 
+# Waypoint parameters
+NUM_WAYPOINTS = 1
+DISTANCE_MARGIN = 5         # km - landing zone radius
+WAYPOINT_DISTANCE_MIN = 75  # km - minimum distance to waypoint
+WAYPOINT_DISTANCE_MAX = 300  # km - maximum distance to waypoint
 
 # =========================
 # Environment
@@ -72,19 +73,18 @@ class DescentEnvXYZ(gym.Env):
 
         self.observation_space = spaces.Dict(
             {
-                "x": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "y": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "z": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "vx": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "vy": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "alt": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "landing_zone_x": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "landing_zone_y": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
-                "target_altitude": spaces.Box(-np.inf, np.inf, dtype=np.float64),
+                "waypoint_distance": spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+                "cos_difference": spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+                "sin_difference": spaces.Box(-np.inf, np.inf, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+                "waypoint_reached": spaces.Box(0, 1, shape=(NUM_WAYPOINTS,), dtype=np.float64),
+                "altitude": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
+                "target_altitude": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64),
+                "vz": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float64)
             }
         )
-
-        self.action_space = spaces.Box(-1, 1, shape=(3,), dtype=np.float64)
+        # holding horizontal velocity constant at 150
+        # vertical velocity, heading 
+        self.action_space = spaces.Box(-1, 1, shape=(2,), dtype=np.float64)
 
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
@@ -96,58 +96,87 @@ class DescentEnvXYZ(gym.Env):
         bs.scr = ScreenDummy()
         bs.stack.stack("DT 1;FF")
 
+        # Logging variables
         self.total_reward = 0
         self.final_altitude = 0
 
-        # Agent position in 3D space (x, y, z)
-        self.x = 0.0
-        self.y = 0.0
+        # Episode state
+        self.reached = False
+        self.landed = False
+        
+        # Initialize observation variables (will be set in reset)
         self.altitude = 0.0
-        
-        # Agent velocities
-        self.vx = 0.0
-        self.vy = 0.0
-        self.alt = 0.0
-        
-        # Agent heading (in degrees)
-        self.heading = 0.0
-        
-        # Landing zone position (x, y) at altitude 0
-        self.landing_zone_x = 0.0
-        self.landing_zone_y = 0.0
+        self.vz = 0.0
+        self.ac_hdg = 0.0
+        self.wpt_dis = 0.0
+        self.wpt_qdr = []
+        self.wpt_reach = [0]
+        self.wpt_cos = 0.0
+        self.wpt_sin = 0.0
+        self.drift = 0.0
+        self.target_alt = 0.0
+        self.wpt_lat = 0.0
+        self.wpt_lon = 0.0
 
+        # previous heading for reward fn
+        self.prev_hdg = None
+
+        # For rendering
         self.window = None
         self.clock = None
         self.font = None
+        self.plane_img = None
 
     # =========================
     # Observation
     # =========================
 
     def _get_obs(self):
-        # Get altitude from BlueSky
-        # self.altitude = bs.traf.alt[0]
-        self.alt = bs.traf.vs[0]
+        # Horizontal observations
+        NM2KM = 1.852
+        ac_idx = bs.traf.id2idx('KL001')
+
+        # Current heading of aircraft
+        self.ac_hdg = bs.traf.hdg[ac_idx]
+        
+        # Get absolute angles between aircraft and waypoint location
+        wpt_qdr, wpt_dis = bs.tools.geo.kwikqdrdist(
+            bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], 
+            self.wpt_lat, self.wpt_lon
+        )
+
+        self.wpt_dis = wpt_dis * NM2KM
+        self.wpt_qdr = [wpt_qdr]  # Store as list for consistency
+
+        drift = self.ac_hdg - wpt_qdr
+        drift = fn.bound_angle_positive_negative_180(drift)
+
+        self.wpt_cos = np.cos(np.deg2rad(drift))
+        self.wpt_sin = np.sin(np.deg2rad(drift))
+        self.drift = drift
+
+        # Vertical Observations - Get altitude from BlueSky
+        self.vz = bs.traf.vs[0]
         self.altitude = bs.traf.alt[0]
 
+        # Normalize observations
+        obs_altitude = np.array([(self.altitude - ALT_MEAN) / ALT_STD])
+        obs_target_alt = np.array([(self.target_alt - ALT_MEAN) / ALT_STD])
 
-        # Calculate relative positions to landing zone
-        rel_x = self.x - self.landing_zone_x
-        rel_y = self.y - self.landing_zone_y
-
-        obs_target_alt = np.array([((self.target_alt- ALT_MEAN)/ALT_STD)])
-
+        # Convert to arrays with shape (NUM_WAYPOINTS,) = (1,)
+        wpt_reach_arr = np.array(self.wpt_reach, dtype=np.float64)
+        
+        # Mask observations if waypoint is reached (multiply by (1 - reached))
+        mask = (wpt_reach_arr - 1) * -1  # 1 if not reached, 0 if reached
 
         obs = {
-            "x": np.array([(rel_x - X_MEAN) / X_STD]),
-            "y": np.array([(rel_y - Y_MEAN) / Y_STD]),
-            "z": np.array([(self.altitude - ALT_MEAN) / ALT_STD]),
-            "vx": np.array([(self.vx - VX_MEAN) / VX_STD]),
-            "vy": np.array([(self.vy - VY_MEAN) / VY_STD]),
-            "alt": np.array([(self.alt - alt_MEAN) / alt_STD]),
-            "landing_zone_x": np.array([(self.landing_zone_x - X_MEAN) / X_STD]),
-            "landing_zone_y": np.array([(self.landing_zone_y - Y_MEAN) / Y_STD]),
+            "waypoint_distance": mask * np.array([self.wpt_dis]) / WAYPOINT_DISTANCE_MAX,
+            "cos_difference": mask * np.array([self.wpt_cos]),
+            "sin_difference": mask * np.array([self.wpt_sin]),
+            "waypoint_reached": wpt_reach_arr,
+            "altitude": obs_altitude,
             "target_altitude": obs_target_alt,
+            "vz": np.array([(self.vz - VZ_MEAN) / VZ_STD]),
         }
 
         return obs
@@ -166,120 +195,138 @@ class DescentEnvXYZ(gym.Env):
     # =========================
 
     def _get_reward(self):
-        # Calculate distance to landing zone
-        dx = self.x - self.landing_zone_x
-        dy = self.y - self.landing_zone_y
-        distance_to_landing_zone = np.sqrt(dx**2 + dy**2)
+        """
+        Reward function for 3D landing task.
 
-        # Check if crashed (altitude <= 0)
+        Objectives:
+        1. Track target altitude when far from landing zone
+        2. Gradually transition to descending as landing zone approaches
+        3. Reach landing zone at low altitude (~0)
+        4. Avoid crashes and oscillatory control
+        """
+
+        # Distance to landing zone (km)
+        d = self.wpt_dis
+
+        # Crash condition
         if self.altitude <= 0:
             reward = CRASH_PENALTY
-            self.final_altitude = -100
-            self.total_reward += reward
-            return reward, True
-
-        # Check if successfully landed (low altitude and close to landing zone)
-        if self.altitude <= 100 and distance_to_landing_zone <= LANDING_DISTANCE_THRESHOLD:
-            reward = LANDING_REWARD
             self.final_altitude = self.altitude
             self.total_reward += reward
             return reward, True
 
-        # Ongoing flight reward (penalize altitude deviation from target and distance from landing zone)
-        # Target altitude decreases as we approach landing zone
-        target_alt = max(0, distance_to_landing_zone * 10)  # Lower target altitude when closer
-        alt_penalty = abs(self.altitude - target_alt) * ALT_DIF_REWARD_SCALE
-        
-        # Small penalty for being far from landing zone
-        distance_penalty = distance_to_landing_zone * -0.1
+        # Distance-based altitude target
+        # alpha = 1 far away, 0 near landing zone
+        alpha = np.clip(d / WAYPOINT_DISTANCE_MAX, 0.0, 1.0)
 
-        alt_diff_penalty = abs(self.target_alt - self.altitude) * ALT_DIF_REWARD_SCALE
-        
-        reward = alt_penalty + distance_penalty + alt_diff_penalty
+        # Desired altitude transitions smoothly:
+        # far -> target_alt
+        # near -> 0
+        desired_alt = alpha * self.target_alt
+
+        # Altitude tracking penalty
+        alt_error = alpha * abs(self.altitude - self.target_alt)
+        altitude_penalty = ALT_DIF_REWARD_SCALE * alt_error
+
+
+        # Encourage getting closer to the landing zone
+        distance_penalty = -0.02 * d
+
+
+        # Penalize aggressive vertical motion
+        vz_penalty = -0.01 * abs(self.vz)
+
+        hdg_penalty = 0
+        # Penalize too many turns, 
+        if self.prev_hdg:
+            hdg_penalty = (self.ac_hdg - self.prev_hdg) * -0.001
+
+        # Waypoint reached logic
+        if d <= DISTANCE_MARGIN and not self.reached:
+            self.reached = True
+            self.wpt_reach = [1]
+
+        # Successful landing condition
+        if self.reached and self.altitude <= 100:
+            reward = REACH_REWARD
+            self.final_altitude = self.altitude
+            self.total_reward += reward
+            self.landed = True
+            return reward, True
+
+        # Bad terminal: reached horizontally but too high
+        if self.reached and self.altitude > 100:
+            reward = RWY_ALT_DIF_REWARD_SCALE * self.altitude
+            self.final_altitude = self.altitude
+            self.total_reward += reward
+            return reward, True
+
+        # Total reward
+        reward = altitude_penalty + distance_penalty + vz_penalty + hdg_penalty
         self.total_reward += reward
+
         return reward, False
+
 
     # =========================
     # Action
     # =========================
 
     def _get_action(self, act):
-        act = np.asarray(act).squeeze()
+        # Action[0]: Vertical speed (climb/descend)
+        alt_action = act[0] * ACTION_2_MS
 
-        # Action 0: vertical speed (z-axis/altitude)
-        alt_cmd = act[0] * ACTION_2_MS_VERT
-        
-        # Action 1: horizontal speed (x-axis)
-        vx_cmd = act[1] * ACTION_2_MS_HORIZ
-        
-        # Action 2: vertical screen movement (y-axis)
-        vy_cmd = act[2] * ACTION_2_MS_HORIZ
-
-        # Apply vertical speed command to BlueSky
-        if alt_cmd >= 0:
-            bs.traf.selalt[0] = 100000
-            bs.traf.selvs[0] = alt_cmd
+        # BlueSky interprets vertical velocity command through altitude commands 
+        # with a vertical speed (magnitude). Check sign of action and give appropriate altitude target
+        if alt_action >= 0:
+            bs.traf.selalt[0] = 1000000  # High target altitude to start climb
+            bs.traf.selvs[0] = alt_action
         else:
-            bs.traf.selalt[0] = 0
-            bs.traf.selvs[0] = alt_cmd
-
-        # Update velocities for x and y axes
-        self.vx = vx_cmd
-        self.vy = vy_cmd
-        self.alt = alt_cmd
+            bs.traf.selalt[0] = 0  # Low target altitude to start descent
+            bs.traf.selvs[0] = alt_action
         
-        # Update heading based on velocity direction
-        if abs(self.vx) > 0.01 or abs(self.vy) > 0.01:
-            heading_rad = np.arctan2(self.vy, self.vx)
-            self.heading = np.degrees(heading_rad)
+        self.prev_hdg = self.ac_hdg
+
+        # Action[1]: Change horizontal heading
+        hdg_action = (self.ac_hdg + act[1] * D_HEADING) % 360
+        bs.stack.stack(f"HDG KL001 {hdg_action}")
 
     # =========================
     # Reset
     # =========================
 
+    def _generate_waypoint(self, acid = "KL001"):
+        wpt_dis_init = np.random.randint(WAYPOINT_DISTANCE_MIN, WAYPOINT_DISTANCE_MAX)
+        wpt_hdg_init = np.random.randint(0, 359)
+
+        ac_idx = bs.traf.id2idx(acid)
+
+        self.wpt_lat, self.wpt_lon = fn.get_point_at_distance(bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], wpt_dis_init, wpt_hdg_init)    
+        self.wpt_reach = [0]  # List for consistency with observation space
+        self.wpt_qdr = []  # Initialize waypoint bearing list
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        alt_init = np.random.randint(ALT_MIN, ALT_MAX)
-        self.target_alt = alt_init + np.random.randint(-TARGET_ALT_DIF,TARGET_ALT_DIF)
-
+        # Reset logging variables
         self.total_reward = 0
         self.final_altitude = 0
+        self.reached = False
+        self.landed = False
 
-        # Randomly place landing zone at some location with altitude 0
-        self.landing_zone_x = np.random.uniform(-MAX_X_RANGE/2, MAX_X_RANGE/2)
-        self.landing_zone_y = np.random.uniform(-MAX_Y_RANGE/2, MAX_Y_RANGE/2)
-
-        # Randomly initialize agent position
+        # Initialize altitude and target altitude
         alt_init = np.random.randint(ALT_MIN, ALT_MAX)
-        self.x = np.random.uniform(-MAX_X_RANGE/2, MAX_X_RANGE/2)
-        self.y = np.random.uniform(-MAX_Y_RANGE/2, MAX_Y_RANGE/2)
-        self.altitude = alt_init
+        self.target_alt = alt_init + np.random.randint(-TARGET_ALT_DIF, TARGET_ALT_DIF)
 
-        # Initialize velocities
-        self.vx = 0.0
-        self.vy = 0.0
-        self.alt = 0.0
-        self.heading = 0.0
-
-        # Create aircraft in BlueSky at initial position
-        # Convert x, y to lat/lon for BlueSky (using a reference point)
-        REF_LAT = 52.0
-        REF_LON = 4.0
-        NM2KM = 1.852
-        
-        # Convert x, y (km) to approximate lat/lon offset
-        lat_offset = self.x / 111.0  # Rough conversion: 1 degree lat ≈ 111 km
-        lon_offset = self.y / (111.0 * np.cos(np.radians(REF_LAT)))
-        
-        init_lat = REF_LAT + lat_offset
-        init_lon = REF_LON + lon_offset
-
-        bs.traf.cre("KL001", actype="A320", acalt=alt_init, acspd=AC_SPD, aclat=init_lat, aclon=init_lon)
+        # Create aircraft in BlueSky (default position)
+        bs.traf.cre("KL001", actype="A320", acalt=alt_init, acspd=AC_SPD)
         bs.traf.swvnav[0] = False
 
+        # Generate landing zone waypoint (after aircraft is created)
+        self._generate_waypoint()
+
         obs = self._get_obs()
-        info = {"total_reward": self.total_reward}
+        info = self._get_info()
 
         if self.render_mode == "human":
             self._render_frame()
@@ -293,47 +340,19 @@ class DescentEnvXYZ(gym.Env):
     def step(self, action):
         self._get_action(action)
 
-        # Time step in seconds (ACTION_FREQUENCY steps per action)
-        # BlueSky sim runs at 1 Hz by default, so each step is 1 second
-        dt = 1.0  # Each BlueSky step is 1 second
-
+        # Run simulation for ACTION_FREQUENCY steps
         for _ in range(ACTION_FREQUENCY):
             bs.sim.step()
             
-            # Update position based on velocity
-            # vx and vy are in m/s, x and y are in km
-            # So we need to convert: distance = velocity * time
-            # distance in km = (velocity in m/s) * (time in s) / 1000
-            self.x += self.vx * dt / 1000.0  # Convert m to km
-            self.y += self.vy * dt / 1000.0  # Convert m to km
-            
-            # Update altitude from BlueSky
-            self.altitude = bs.traf.alt[0]
-            
-            # Update aircraft position in BlueSky based on x, y movements
-            # Convert x, y (km) back to lat/lon
-            REF_LAT = 52.0
-            REF_LON = 4.0
-            lat_offset = self.x / 111.0  # 1 degree lat ≈ 111 km
-            lon_offset = self.y / (111.0 * np.cos(np.radians(REF_LAT)))
-            new_lat = REF_LAT + lat_offset
-            new_lon = REF_LON + lon_offset
-            
-            # Update aircraft position in BlueSky
-            if len(bs.traf.id) > 0:
-                try:
-                    bs.traf.lat[0] = new_lat
-                    bs.traf.lon[0] = new_lon
-                except (IndexError, AttributeError):
-                    pass
-
             if self.render_mode == "human":
+                self._get_obs()  # Update observations for rendering
                 self._render_frame()
 
         obs = self._get_obs()
         reward, terminated = self._get_reward()
-        info = {"total_reward": self.total_reward}
+        info = self._get_info()
 
+        # Delete aircraft if episode terminated
         if terminated:
             for acid in bs.traf.id:
                 try:
@@ -363,87 +382,104 @@ class DescentEnvXYZ(gym.Env):
             pygame.init()
             pygame.display.init()
             self.window = pygame.display.set_mode(self.window_size)
-            # Enable per-pixel alpha for transparency
-            self.window.set_alpha(None)
 
         if self.clock is None:
             self.clock = pygame.time.Clock()
 
+        max_distance = 200  # Width of screen in km
+
         canvas = pygame.Surface(self.window_size)
         # Fill entire background with blue
-        canvas.fill((135,206,235))
+        canvas.fill((135, 206, 235))
 
-        # Convert world coordinates to screen coordinates
-        # Center of screen is (0, 0) in world coordinates
-        center_x = self.window_width / 2
-        center_y = self.window_height / 2
+        # Get aircraft index and heading
+        ac_idx = bs.traf.id2idx('KL001')
         
-        # Scale factors
-        scale_x = self.window_width / MAX_X_RANGE
-        scale_y = self.window_height / MAX_Y_RANGE
-
-        # Draw landing zone (same shape as waypoints in plan_waypoint_env.py)
-        landing_zone_screen_x = int(center_x + self.landing_zone_x * scale_x)
-        landing_zone_screen_y = int(center_y + self.landing_zone_y * scale_y)
-        
-        # Draw landing zone as two circles (filled inner circle and outline outer circle)
-        landing_zone_color = (0, 0, 0)  # Black
-        # Inner filled circle
-        pygame.draw.circle(
-            canvas,
-            landing_zone_color,
-            (landing_zone_screen_x, landing_zone_screen_y),
-            radius=4,
-            width=0
-        )
-        # Outer outline circle (radius based on landing distance threshold)
-        pygame.draw.circle(
-            canvas,
-            landing_zone_color,
-            (landing_zone_screen_x, landing_zone_screen_y),
-            radius=int((LANDING_DISTANCE_THRESHOLD / MAX_X_RANGE) * self.window_width),
-            width=2
-        )
-
-        # Draw aircraft position
-        aircraft_screen_x = int(center_x + self.x * scale_x)
-        aircraft_screen_y = int(center_y + self.y * scale_y)
-
-        # Use stored heading (updated in _get_action based on velocity)
-        heading_deg = self.heading
-
         # Get red color value based on altitude (dark red at 0, lighter as altitude increases)
         red_value = self._altitude_to_red_color(self.altitude)
         aircraft_color = (red_value, 0, 0)  # Red color, brightness based on altitude
 
-        # Draw aircraft as a line (same as plan_waypoint_env.py)
+        # Draw aircraft (ownship) at center of screen
         ac_length = 8
-        # Convert length to screen coordinates
-        ac_length_screen = (ac_length / MAX_X_RANGE) * self.window_width
-        heading_end_x = np.cos(np.deg2rad(heading_deg)) * ac_length_screen
-        heading_end_y = np.sin(np.deg2rad(heading_deg)) * ac_length_screen
+        heading_end_x = ((np.cos(np.deg2rad(bs.traf.hdg[ac_idx])) * ac_length) / max_distance) * self.window_width
+        heading_end_y = ((np.sin(np.deg2rad(bs.traf.hdg[ac_idx])) * ac_length) / max_distance) * self.window_width
 
         pygame.draw.line(
             canvas,
             aircraft_color,
-            (aircraft_screen_x, aircraft_screen_y),
-            (aircraft_screen_x + heading_end_x, aircraft_screen_y - heading_end_y),
+            (self.window_width / 2, self.window_height / 2),
+            ((self.window_width / 2) + heading_end_x, (self.window_height / 2) - heading_end_y),
             width=4
         )
 
         # Draw heading line (longer line showing heading direction)
         heading_length = 50
-        heading_length_screen = (heading_length / MAX_X_RANGE) * self.window_width
-        heading_end_x = np.cos(np.deg2rad(heading_deg)) * heading_length_screen
-        heading_end_y = np.sin(np.deg2rad(heading_deg)) * heading_length_screen
+        heading_end_x = ((np.cos(np.deg2rad(bs.traf.hdg[ac_idx])) * heading_length) / max_distance) * self.window_width
+        heading_end_y = ((np.sin(np.deg2rad(bs.traf.hdg[ac_idx])) * heading_length) / max_distance) * self.window_width
 
         pygame.draw.line(
             canvas,
             (0, 0, 0),  # Black heading line
-            (aircraft_screen_x, aircraft_screen_y),
-            (aircraft_screen_x + heading_end_x, aircraft_screen_y - heading_end_y),
+            (self.window_width / 2, self.window_height / 2),
+            ((self.window_width / 2) + heading_end_x, (self.window_height / 2) - heading_end_y),
             width=1
         )
+
+        # Draw aircraft (sprite)
+        # # Lazy-load plane sprite
+        # if self.plane_img is None:
+        #     self.plane_img = pygame.image.load("static\plane.png").convert_alpha()
+        #     self.plane_img = pygame.transform.smoothscale(self.plane_img, (32, 32))
+
+        # # Rotate sprite to match heading
+        # # Pygame rotates CCW; heading is CW → negate
+        # hdg = bs.traf.hdg[ac_idx]
+        # rotated_plane = pygame.transform.rotate(self.plane_img, -hdg)
+
+        # # Altitude-based red tint
+        # red_value = self._altitude_to_red_color(self.altitude)
+        # tint = pygame.Surface(rotated_plane.get_size(), pygame.SRCALPHA)
+        # tint.fill((red_value, 0, 0, 80))  # last value = transparency
+        # rotated_plane.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        # # Draw centered at aircraft position
+        # plane_rect = rotated_plane.get_rect(
+        #     center=(self.window_width // 2, self.window_height // 2)
+        # )
+        # canvas.blit(rotated_plane, plane_rect)
+
+
+        # Draw landing zone waypoint (relative to aircraft position)
+        if len(self.wpt_qdr) > 0:
+            qdr = self.wpt_qdr[0]
+            dis = self.wpt_dis
+
+            circle_x = ((np.cos(np.deg2rad(qdr)) * dis) / max_distance) * self.window_width
+            circle_y = ((np.sin(np.deg2rad(qdr)) * dis) / max_distance) * self.window_width
+
+            # Color based on whether waypoint is reached
+            if self.reached:
+                color = (155, 155, 155)  # Gray if reached
+            else:
+                color = (0, 0, 0)  # Black if not reached
+
+            # Inner filled circle
+            pygame.draw.circle(
+                canvas,
+                color,
+                ((self.window_width / 2) + circle_x, (self.window_height / 2) - circle_y),
+                radius=4,
+                width=0
+            )
+
+            # Outer outline circle (radius based on distance margin)
+            pygame.draw.circle(
+                canvas,
+                color,
+                ((self.window_width / 2) + circle_x, (self.window_height / 2) - circle_y),
+                radius=int((DISTANCE_MARGIN / max_distance) * self.window_width),
+                width=2
+            )
 
         # Draw altitude text on screen
         if self.font is None:
@@ -453,6 +489,16 @@ class DescentEnvXYZ(gym.Env):
         text_surface = self.font.render(altitude_text, True, (0, 0, 0))  # Black text
         canvas.blit(text_surface, (10, 10))  # Position at top-left corner
 
+        # Draw distance to waypoint
+        distance_text = f"Distance: {self.wpt_dis:.1f} km"
+        dist_surface = self.font.render(distance_text, True, (0, 0, 0))
+        canvas.blit(dist_surface, (10, 40))
+
+        # Draw lat/longs
+        lat_long_text = f"Latitude: {bs.traf.lat[ac_idx]:.2f}{chr(176)}, Longitude: {bs.traf.lon[ac_idx]:.2f}{chr(176)}"
+        lat_long_surface = self.font.render(lat_long_text, True, (0, 0, 0))
+        canvas.blit(lat_long_surface, (10, 70))
+        
         self.window.blit(canvas, canvas.get_rect())
         pygame.display.update()
         self.clock.tick(self.metadata["render_fps"])
