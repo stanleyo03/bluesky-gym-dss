@@ -144,8 +144,17 @@ class DescentEnv(gym.Env):
             self.total_reward += reward
             return reward, 1
         
-    def _get_action(self,action):
+    def _get_action(self, act):
         # Transform action to the meters per second
+        
+        action = np.asarray(act).squeeze()
+
+        if isinstance(action, np.ndarray):
+            if action.size != 1:
+                raise ValueError(f"Expected 1 action")
+        
+        action = float(action)
+
         action = action * ACTION_2_MS
 
         # Bluesky interpretes vertical velocity command through altitude commands 
@@ -154,7 +163,9 @@ class DescentEnv(gym.Env):
 
         # The actions are then executed through stack commands;
         if action >= 0:
+            # selected altitude
             bs.traf.selalt[0] = 1000000 # High target altitude to start climb
+            # Selected vertical speed
             bs.traf.selvs[0] = action
         elif action < 0:
             bs.traf.selalt[0] = 0 # High target altitude to start descent

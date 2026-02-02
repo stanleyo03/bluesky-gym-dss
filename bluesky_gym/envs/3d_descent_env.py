@@ -237,9 +237,9 @@ class DescentEnvXYZ(gym.Env):
         vz_penalty = -0.01 * abs(self.vz)
 
         hdg_penalty = 0
-        # Penalize too many turns, 
+        # Penalize too many turns, increases as it gets closer to landing 
         if self.prev_hdg:
-            hdg_penalty = (self.ac_hdg - self.prev_hdg) * -0.001
+            hdg_penalty = (self.ac_hdg - self.prev_hdg) * -0.001 * alpha
 
         # Waypoint reached logic
         if d <= DISTANCE_MARGIN and not self.reached:

@@ -55,7 +55,7 @@ class PlanWaypointEnv(gym.Env):
                 "waypoint_reached": spaces.Box(0, 1, shape = (NUM_WAYPOINTS,), dtype=np.float64)
             }
         )
-       
+        # Change heading by up to 45 deg   
         self.action_space = spaces.Box(-1, 1, shape=(1,), dtype=np.float64)
 
         assert render_mode is None or render_mode in self.metadata["render_modes"]
@@ -90,7 +90,7 @@ class PlanWaypointEnv(gym.Env):
         in cosine and sine decomposition.
 
         """
-
+        # Nautical Miles 
         NM2KM = 1.852
         ac_idx = bs.traf.id2idx('KL001')
 
@@ -101,8 +101,9 @@ class PlanWaypointEnv(gym.Env):
         self.wpt_sin = []
         
         for lat, lon in zip(self.wpt_lat, self.wpt_lon):
-            
+            # Current heading of aircraft
             self.ac_hdg = bs.traf.hdg[ac_idx]
+            # Get's absolute angles between aircraft and waypoint location
             wpt_qdr, wpt_dis = bs.tools.geo.kwikqdrdist(bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], lat, lon)
         
             self.wpt_dis.append(wpt_dis * NM2KM)
@@ -146,7 +147,7 @@ class PlanWaypointEnv(gym.Env):
         else:
             return reach_reward, 1
         
-    def _get_action(self,action):
+    def _get_action(self, action):
 
         # Transform action to the change in heading
         # action = np.random.randint(-100,100)/100
@@ -212,6 +213,9 @@ class PlanWaypointEnv(gym.Env):
             self.wpt_lat.append(wpt_lat)
             self.wpt_lon.append(wpt_lon)
             self.wpt_reach.append(0)
+
+            print(f"{i} WPT Lat {wpt_lat}")
+            print(f"{i} WPT Lon {wpt_lon}")
 
     def _check_waypoint(self):
         reward = 0
