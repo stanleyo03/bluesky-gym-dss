@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import pygame
 
@@ -75,7 +76,7 @@ class DescentEnvXYZ(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": 120}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, scenario_path=None):
         self.window_width = 512
         self.window_height = 512
         self.window_size = (self.window_width, self.window_height)
@@ -105,6 +106,8 @@ class DescentEnvXYZ(gym.Env):
 
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
+        self.scenario_path = scenario_path
+        self.intruder_ids = []
 
         # Initialize BlueSky
         if bs.sim is None:
@@ -144,6 +147,46 @@ class DescentEnvXYZ(gym.Env):
         self.clock = None
         self.font = None
         self.plane_img = None
+
+    # =========================
+    # Scenario loading
+    # =========================
+
+    def _read_scn_commands(self, scn_path: str):
+        """Read a BlueSky scenario file and return a list of commands (strip timestamps and comments)."""
+        cmds = []
+        for raw in Path(scn_path).read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ">" not in line:
+                continue
+            _, cmd = line.split(">", 1)
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+
+            if cmd.startswith("DEL "):
+                continue
+
+            cmds.append(cmd)
+        return cmds
+
+    def _load_scenario(self, scn_path: str):
+        """Execute all of the commands from a scenario file."""
+        for cmd in self._read_scn_commands(scn_path):
+            bs.stack.stack(cmd)
+
+    def _infer_intruder_ids(self, scn_path: str):
+        """Get the intruder aircraft IDs by reading CRE commands from the scenario."""
+        ids = []
+        for cmd in self._read_scn_commands(scn_path):
+            if cmd.startswith("CRE "):
+                parts = cmd.split()
+                if len(parts) >= 2:
+                    acid = parts[1].split(",")[0].strip()
+                    ids.append(acid)
+        return ids
 
     # =========================
     # Observation
@@ -199,8 +242,10 @@ class DescentEnvXYZ(gym.Env):
         self.y_difference_speed = []
         self.z_difference_speed = []
 
-        for i in range(NUM_INTRUDERS):
-            int_idx = i + 1
+        intruder_ids = self.intruder_ids[:NUM_INTRUDERS]
+
+        for acid in intruder_ids:
+            int_idx = bs.traf.id2idx(acid)
 
             int_qdr, int_dis = bs.tools.geo.kwikqdrdist(bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], bs.traf.lat[int_idx], bs.traf.lon[int_idx])
 
@@ -224,6 +269,16 @@ class DescentEnvXYZ(gym.Env):
 
             self.x_difference_speed.append(x_dif)
             self.y_difference_speed.append(y_dif)
+
+        # Pad intruder arrays to fixed length NUM_INTRUDERS
+        while len(self.intruder_distance) < NUM_INTRUDERS:
+            self.intruder_distance.append(WAYPOINT_DISTANCE_MAX)   # "far away"
+            self.cos_bearing.append(1.0)
+            self.sin_bearing.append(0.0)
+            self.altitude_difference.append(0.0)
+            self.x_difference_speed.append(0.0)
+            self.y_difference_speed.append(0.0)
+            self.z_difference_speed.append(0.0)
         
 
         obs = {
@@ -263,10 +318,15 @@ class DescentEnvXYZ(gym.Env):
         ac_idx = bs.traf.id2idx('KL001')
         reward = 0
 
-        for i in range(NUM_INTRUDERS):
-            int_idx = i + 1
-            _, int_dis = bs.tools.geo.kwikqdrdist(bs.traf.lat[ac_idx], bs.traf.lon[ac_idx], bs.traf.lat[int_idx], bs.traf.lon[int_idx])
-        
+        intruder_ids = self.intruder_ids[:NUM_INTRUDERS]
+
+        for acid in intruder_ids:
+            int_idx = bs.traf.id2idx(acid)
+            _, int_dis = bs.tools.geo.kwikqdrdist(
+                bs.traf.lat[ac_idx], bs.traf.lon[ac_idx],
+                bs.traf.lat[int_idx], bs.traf.lon[int_idx]
+            )
+
             if int_dis < INTRUSION_DISTANCE:
                 self.total_intrusions += 1
                 reward += INTRUSION_PENALTY
@@ -419,10 +479,15 @@ class DescentEnvXYZ(gym.Env):
         self.target_alt = alt_init + np.random.randint(-TARGET_ALT_DIF, TARGET_ALT_DIF)
 
         # Create aircraft in BlueSky (default position)
-        bs.traf.cre("KL001", actype="A320", acalt=alt_init, acspd=AC_SPD)
+        bs.traf.cre("KL001", actype="A320", acalt=alt_init, acspd=AC_SPD) #KL001 is never used as a callsign in the scen files
         bs.traf.swvnav[0] = False
 
-        self._generate_intruders()
+        # Load intruders from scenario file (every aircraft created is an intruder)
+        if self.scenario_path is not None:
+            self._load_scenario(self.scenario_path)
+            self.intruder_ids = self._infer_intruder_ids(self.scenario_path)
+        else:
+            self.intruder_ids = []
 
         # Generate landing zone waypoint (after aircraft is created)
         self._generate_waypoint()
@@ -604,9 +669,12 @@ class DescentEnvXYZ(gym.Env):
          # draw intruders
         ac_length = 3
 
-        for i in range(NUM_INTRUDERS):
-            int_idx = i+1
+        intruder_ids = self.intruder_ids[:NUM_INTRUDERS]
+
+        for acid in intruder_ids:
+            int_idx = bs.traf.id2idx(acid)
             int_hdg = bs.traf.hdg[int_idx]
+
             heading_end_x = ((np.cos(np.deg2rad(int_hdg)) * ac_length)/max_distance)*self.window_width
             heading_end_y = ((np.sin(np.deg2rad(int_hdg)) * ac_length)/max_distance)*self.window_width
 
